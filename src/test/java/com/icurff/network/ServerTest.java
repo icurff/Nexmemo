@@ -1,13 +1,17 @@
 package com.icurff.network;
 
+import com.icurff.protocol.RespEncoder;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -32,19 +36,38 @@ class ServerTest {
     }
 
     private static void echo(Socket client, byte[] bytes) throws IOException {
-        client.getOutputStream().write(bytes);
-        assertArrayEquals(bytes, client.getInputStream().readNBytes(bytes.length));
+        client.getOutputStream().write(echoRequest(bytes));
+        byte[] expected = bulk(bytes);
+        assertArrayEquals(expected, client.getInputStream().readNBytes(expected.length));
+    }
+
+    private static byte[] ascii(String value) {
+        return value.getBytes(StandardCharsets.US_ASCII);
+    }
+
+    private static byte[] echoRequest(byte[] bytes) {
+        return RespEncoder.request(List.of(ascii("ECHO"), bytes)).array();
+    }
+
+    private static byte[] bulk(byte[] bytes) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        output.write(ascii("$" + bytes.length + "\r\n"));
+        output.write(bytes);
+        output.write(ascii("\r\n"));
+        return output.toByteArray();
     }
 
     @Test
-    void echoesFragmentedAndCombinedBinaryData() throws Exception {
+    void echoesFragmentedRespWithBinaryData() throws Exception {
         try (RunningServer running = new RunningServer();
              Socket client = connect(running.server)) {
             byte[] bytes = {0, 13, 10, (byte) 255, 42, 0, (byte) 128};
-            for (byte value : bytes) {
+            client.setTcpNoDelay(true);
+            for (byte value : echoRequest(bytes)) {
                 client.getOutputStream().write(value);
-                assertEquals(Byte.toUnsignedInt(value), client.getInputStream().read());
             }
+            byte[] expected = bulk(bytes);
+            assertArrayEquals(expected, client.getInputStream().readNBytes(expected.length));
             echo(client, bytes);
             echo(client, new byte[]{1, 2, 3});
         }
@@ -57,11 +80,12 @@ class ServerTest {
              Socket client = connect(running.server)) {
             byte[] bytes = payload(512 * 1024);
             Future<?> writer = executor.submit(() -> {
-                client.getOutputStream().write(bytes);
+                client.getOutputStream().write(echoRequest(bytes));
                 client.shutdownOutput();
                 return null;
             });
-            assertArrayEquals(bytes, client.getInputStream().readNBytes(bytes.length));
+            byte[] expected = bulk(bytes);
+            assertArrayEquals(expected, client.getInputStream().readNBytes(expected.length));
             assertEquals(-1, client.getInputStream().read());
             writer.get(5, TimeUnit.SECONDS);
         }
@@ -96,22 +120,29 @@ class ServerTest {
              var executor = Executors.newVirtualThreadPerTaskExecutor();
              Socket slow = connect(running.server);
              Socket normal = connect(running.server)) {
-            byte[] bytes = payload(4 * 1024 * 1024);
+            ByteArrayOutputStream requests = new ByteArrayOutputStream();
+            ByteArrayOutputStream responses = new ByteArrayOutputStream();
+            for (int i = 0; i < 4; i++) {
+                byte[] bytes = payload(1024 * 1024);
+                requests.write(echoRequest(bytes));
+                responses.write(bulk(bytes));
+            }
+            byte[] expected = responses.toByteArray();
             Future<?> writer = executor.submit(() -> {
-                slow.getOutputStream().write(bytes);
+                slow.getOutputStream().write(requests.toByteArray());
                 slow.shutdownOutput();
                 return null;
             });
             // Receive the first byte, then leave the rest unread while using another client.
-            assertEquals(Byte.toUnsignedInt(bytes[0]), slow.getInputStream().read());
+            assertEquals(Byte.toUnsignedInt(expected[0]), slow.getInputStream().read());
             for (int round = 0; round < 10; round++) {
                 echo(normal, payload(256));
             }
-            byte[] echoed = new byte[bytes.length];
-            echoed[0] = bytes[0];
-            assertEquals(bytes.length - 1,
-                    slow.getInputStream().readNBytes(echoed, 1, bytes.length - 1));
-            assertArrayEquals(bytes, echoed);
+            byte[] echoed = new byte[expected.length];
+            echoed[0] = expected[0];
+            assertEquals(expected.length - 1,
+                    slow.getInputStream().readNBytes(echoed, 1, expected.length - 1));
+            assertArrayEquals(expected, echoed);
             assertEquals(-1, slow.getInputStream().read());
             writer.get(5, TimeUnit.SECONDS);
         }
@@ -123,12 +154,132 @@ class ServerTest {
             for (int round = 0; round < 10; round++) {
                 try (Socket reset = connect(running.server)) {
                     reset.setSoLinger(true, 0);
-                    reset.getOutputStream().write(payload(1024));
+                    reset.getOutputStream().write(echoRequest(payload(1024)));
                 }
                 try (Socket healthy = connect(running.server)) {
                     echo(healthy, new byte[]{1, 0, (byte) 255});
                 }
             }
+        }
+    }
+
+    @Test
+    void processesBufferedPipelineInOrderWithoutMoreNetworkInput() throws Exception {
+        try (RunningServer running = new RunningServer();
+             Socket client = connect(running.server)) {
+            ByteArrayOutputStream requests = new ByteArrayOutputStream();
+            ByteArrayOutputStream expected = new ByteArrayOutputStream();
+            for (int i = 0; i < 500; i++) {
+                byte[] value = ascii("message-" + i);
+                requests.write(echoRequest(value));
+                expected.write(bulk(value));
+            }
+            client.getOutputStream().write(requests.toByteArray());
+            assertArrayEquals(expected.toByteArray(), client.getInputStream().readNBytes(expected.size()));
+            // The pipeline is drained with the connection still open.
+            echo(client, new byte[0]);
+        }
+    }
+
+    @Test
+    void keepsReadingRequestsWhileClientHasNotReadQueuedResponses() throws Exception {
+        try (RunningServer running = new RunningServer();
+             var executor = Executors.newVirtualThreadPerTaskExecutor();
+             Socket client = new Socket()) {
+            client.setSoTimeout(4000);
+            client.setSendBufferSize(8192);
+            client.setReceiveBufferSize(256 * 1024);
+            client.setTcpNoDelay(true);
+            client.connect(running.server.localAddress(), 3000);
+            byte[] bytes = payload(256 * 1024);
+            byte[] request = echoRequest(bytes);
+            byte[] expected = bulk(bytes);
+            int requestCount = 64;
+            Future<?> writer = executor.submit(() -> {
+                for (int i = 0; i < requestCount; i++) {
+                    client.getOutputStream().write(request);
+                }
+                return null;
+            });
+            // Send 16 MiB before reading any response. Writes must not pause server reads.
+            writer.get(5, TimeUnit.SECONDS);
+            for (int i = 0; i < requestCount; i++) {
+                assertArrayEquals(expected, client.getInputStream().readNBytes(expected.length));
+            }
+            echo(client, ascii("pipeline drained"));
+        }
+    }
+
+    @Test
+    void handlesPingCaseArityAndUnknownCommandWithoutClosingConnection() throws Exception {
+        try (RunningServer running = new RunningServer();
+             Socket client = connect(running.server)) {
+            ByteArrayOutputStream requests = new ByteArrayOutputStream();
+            requests.write(RespEncoder.request(List.of(ascii("pInG"))).array());
+            requests.write(RespEncoder.request(List.of(ascii("PING"), new byte[0])).array());
+            requests.write(RespEncoder.request(List.of(ascii("PING"), ascii("a"), ascii("b"))).array());
+            requests.write(RespEncoder.request(List.of(ascii("ECHO"))).array());
+            requests.write(RespEncoder.request(List.of(ascii("GET"), ascii("key"))).array());
+            requests.write(RespEncoder.request(List.of(new byte[]{0, 13, 10, (byte) 255})).array());
+            String expected = "+PONG\r\n$0\r\n\r\n"
+                    + "-ERR wrong number of arguments for 'ping' command\r\n"
+                    + "-ERR wrong number of arguments for 'echo' command\r\n"
+                    + "-ERR unknown command\r\n-ERR unknown command\r\n";
+            client.getOutputStream().write(requests.toByteArray());
+            assertArrayEquals(ascii(expected), client.getInputStream().readNBytes(ascii(expected).length));
+            echo(client, "xin chào".getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    void sendsEarlierRepliesThenProtocolErrorAndClosesOnlyOffendingClient() throws Exception {
+        try (RunningServer running = new RunningServer();
+             Socket client = connect(running.server)) {
+            client.getOutputStream().write(ascii("*1\r\n$4\r\nPING\r\n*1\r\n$1\r\nX!*1\r\n$4\r\nPING\r\n"));
+            String response = new String(client.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
+            assertTrue(response.startsWith("+PONG\r\n-ERR Protocol error: "), response);
+            assertTrue(response.endsWith("\r\n"));
+            assertFalse(response.substring("+PONG\r\n".length()).contains("+PONG"), response);
+            try (Socket healthy = connect(running.server)) {
+                echo(healthy, ascii("still alive"));
+            }
+        }
+    }
+
+    @Test
+    void eofAfterPipelineDrainsRepliesAndReportsTrailingIncompleteRequest() throws Exception {
+        try (RunningServer running = new RunningServer();
+             Socket client = connect(running.server)) {
+            client.getOutputStream().write(ascii("*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPI"));
+            client.shutdownOutput();
+            assertEquals("+PONG\r\n+PONG\r\n-ERR Protocol error: unexpected EOF in request\r\n",
+                    new String(client.getInputStream().readAllBytes(), StandardCharsets.US_ASCII));
+        }
+    }
+
+    @Test
+    void eofOnIdleConnectionClosesCleanly() throws Exception {
+        try (RunningServer running = new RunningServer();
+             Socket client = connect(running.server)) {
+            client.shutdownOutput();
+            assertEquals(-1, client.getInputStream().read());
+        }
+    }
+
+    @Test
+    void echoesBeyondFormerRequestLimitAndReusesConnection() throws Exception {
+        try (RunningServer running = new RunningServer();
+             var executor = Executors.newVirtualThreadPerTaskExecutor();
+             Socket client = connect(running.server)) {
+            byte[] bytes = payload(3 * 1024 * 1024);
+            Future<?> writer = executor.submit(() -> {
+                client.getOutputStream().write(echoRequest(bytes));
+                return null;
+            });
+            byte[] expected = bulk(bytes);
+            assertArrayEquals(expected, client.getInputStream().readNBytes(expected.length));
+            writer.get(5, TimeUnit.SECONDS);
+            echo(client, ascii("after buffer growth"));
         }
     }
 
