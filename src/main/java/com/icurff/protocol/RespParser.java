@@ -6,119 +6,111 @@ import java.util.List;
 
 public final class RespParser {
     private enum State {
-        ARRAY_PREFIX, ARRAY_LENGTH, ARRAY_LF, BULK_PREFIX, BULK_LENGTH, BULK_LF,
-        DATA, DATA_CR, DATA_LF
+        ARRAY_LENGTH, BULK_LENGTH, BULK_DATA
     }
 
-    private State state = State.ARRAY_PREFIX;
+    private State state = State.ARRAY_LENGTH;
     private List<byte[]> arguments;
     private int argumentCount;
-    private byte[] payload;
-    private int payloadOffset;
-    private int number;
-    private int digits;
+    private int bulkLength;
+    private boolean partialHeader;
     private boolean failed;
 
-    /**
-     * Consumes input in read mode. Returns one request, or null if more bytes are
-     * needed. The result owns its payload arrays and never retains input.
-     * Leaves subsequent pipelined requests in input.
-     * After a ProtocolException this parser cannot be reused.
-     */
+    /** Leaves incomplete headers and bulk data in input for the next read. */
     public List<byte[]> parse(ByteBuffer input) throws ProtocolException {
         if (failed) {
             throw new IllegalStateException("Parser failed; close the connection");
         }
         try {
             while (input.hasRemaining()) {
-                if (state == State.DATA) {
-                    int count = Math.min(input.remaining(), payload.length - payloadOffset);
-                    input.get(payload, payloadOffset, count);
-                    payloadOffset += count;
-                    if (payloadOffset == payload.length) {
-                        state = State.DATA_CR;
+                if (state == State.BULK_DATA) {
+                    int remaining = input.remaining();
+                    if (remaining > bulkLength && input.get(input.position() + bulkLength) != '\r') {
+                        throw new ProtocolException("unexpected byte in RESP frame");
                     }
-                    continue;
-                }
-
-                byte value = input.get();
-                switch (state) {
-                    case ARRAY_PREFIX, BULK_PREFIX -> {
-                        boolean array = state == State.ARRAY_PREFIX;
-                        expect(value, array ? '*' : '$');
-                        number = 0;
-                        digits = 0;
-                        state = array ? State.ARRAY_LENGTH : State.BULK_LENGTH;
+                    if ((long) remaining > (long) bulkLength + 1
+                            && input.get(input.position() + bulkLength + 1) != '\n') {
+                        throw new ProtocolException("unexpected byte in RESP frame");
                     }
-                    case ARRAY_LENGTH, BULK_LENGTH -> {
-                        boolean array = state == State.ARRAY_LENGTH;
-                        if (value == '\r') {
-                            if (digits == 0) {
-                                throw new ProtocolException("missing length");
-                            }
-                            if (array && number == 0) {
-                                throw new ProtocolException("empty command array");
-                            }
-                            state = array ? State.ARRAY_LF : State.BULK_LF;
-                        } else {
-                            if (value < '0' || value > '9') {
-                                throw new ProtocolException("expected unsigned decimal length");
-                            }
-                            long next = (long) number * 10 + (value - '0');
-                            digits++;
-                            if (digits > 10 || next > Integer.MAX_VALUE) {
-                                throw new ProtocolException("length exceeds Java array capacity");
-                            }
-                            number = (int) next;
-                        }
+                    if ((long) remaining < (long) bulkLength + 2) {
+                        return null;
                     }
-                    case ARRAY_LF -> {
-                        expect(value, '\n');
-                        argumentCount = number;
+                    byte[] argument = new byte[bulkLength];
+                    input.get(argument);
+                    input.position(input.position() + 2);
+                    arguments.add(argument);
+                    if (arguments.size() == argumentCount) {
+                        List<byte[]> request = List.copyOf(arguments);
+                        arguments = null;
+                        state = State.ARRAY_LENGTH;
+                        return request;
+                    }
+                    state = State.BULK_LENGTH;
+                } else {
+                    int length = parseLength(input);
+                    if (length < 0) {
+                        partialHeader = true;
+                        return null;
+                    }
+                    partialHeader = false;
+                    if (state == State.ARRAY_LENGTH) {
+                        argumentCount = length;
                         arguments = new ArrayList<>();
-                        state = State.BULK_PREFIX;
+                        state = State.BULK_LENGTH;
+                    } else {
+                        bulkLength = length;
+                        state = State.BULK_DATA;
                     }
-                    case BULK_LF -> {
-                        expect(value, '\n');
-                        payload = new byte[number];
-                        payloadOffset = 0;
-                        state = number == 0 ? State.DATA_CR : State.DATA;
-                    }
-                    case DATA_CR -> {
-                        expect(value, '\r');
-                        state = State.DATA_LF;
-                    }
-                    case DATA_LF -> {
-                        expect(value, '\n');
-                        arguments.add(payload);
-                        payload = null;
-                        if (arguments.size() == argumentCount) {
-                            List<byte[]> request = List.copyOf(arguments);
-                            arguments = null;
-                            state = State.ARRAY_PREFIX;
-                            return request;
-                        }
-                        state = State.BULK_PREFIX;
-                    }
-                    default -> throw new IllegalStateException("Unexpected parser state");
                 }
             }
             return null;
         } catch (ProtocolException exception) {
             failed = true;
             arguments = null;
-            payload = null;
             throw exception;
         }
     }
 
     public boolean hasPartialRequest() {
-        return state != State.ARRAY_PREFIX;
+        return state != State.ARRAY_LENGTH || partialHeader;
     }
 
-    private static void expect(byte actual, char expected) throws ProtocolException {
-        if (actual != expected) {
+    /** Returns -1 without consuming input when the header is incomplete. */
+    private int parseLength(ByteBuffer input) throws ProtocolException {
+        int start = input.position();
+        char prefix = state == State.ARRAY_LENGTH ? '*' : '$';
+        if (input.get(start) != prefix) {
             throw new ProtocolException("unexpected byte in RESP frame");
         }
+        int length = 0;
+        int digits = 0;
+        for (int position = start + 1; position < input.limit(); position++) {
+            byte value = input.get(position);
+            if (value == '\r') {
+                if (digits == 0) {
+                    throw new ProtocolException("missing length");
+                }
+                if (state == State.ARRAY_LENGTH && length == 0) {
+                    throw new ProtocolException("empty command array");
+                }
+                if (position + 1 == input.limit()) {
+                    return -1;
+                }
+                if (input.get(position + 1) != '\n') {
+                    throw new ProtocolException("unexpected byte in RESP frame");
+                }
+                input.position(position + 2);
+                return length;
+            }
+            if (value < '0' || value > '9') {
+                throw new ProtocolException("expected unsigned decimal length");
+            }
+            long nextLength = (long) length * 10 + (value - '0');
+            if (++digits > 10 || nextLength > Integer.MAX_VALUE) {
+                throw new ProtocolException("length exceeds Java array capacity");
+            }
+            length = (int) nextLength;
+        }
+        return -1;
     }
 }

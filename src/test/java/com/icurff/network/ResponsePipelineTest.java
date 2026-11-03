@@ -69,7 +69,7 @@ class ResponsePipelineTest {
     void preservesPendingSlotReferencesAndResponseOrderAcrossGrowth() {
         ResponsePipeline pipeline = new ResponsePipeline();
         Queue<ByteBuffer> output = new ArrayDeque<>(128);
-        var slots = new ArrayList<ResponsePipeline.Slot>();
+        var slots = new ArrayList<ResponsePipeline.ResponseSlot>();
         var responses = new ArrayList<ByteBuffer>();
         for (int i = 0; i < 400; i++) {
             slots.add(pipeline.reserve());

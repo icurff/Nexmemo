@@ -1,5 +1,6 @@
 package com.icurff.network;
 
+import com.icurff.testutil.RespRequests;
 import com.icurff.protocol.RespEncoder;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -46,7 +47,7 @@ class ServerTest {
     }
 
     private static byte[] echoRequest(byte[] bytes) {
-        return RespEncoder.request(List.of(ascii("ECHO"), bytes)).array();
+        return RespRequests.request(List.of(ascii("ECHO"), bytes)).array();
     }
 
     private static byte[] bulk(byte[] bytes) throws IOException {
@@ -215,12 +216,12 @@ class ServerTest {
         try (RunningServer running = new RunningServer();
              Socket client = connect(running.server)) {
             ByteArrayOutputStream requests = new ByteArrayOutputStream();
-            requests.write(RespEncoder.request(List.of(ascii("pInG"))).array());
-            requests.write(RespEncoder.request(List.of(ascii("PING"), new byte[0])).array());
-            requests.write(RespEncoder.request(List.of(ascii("PING"), ascii("a"), ascii("b"))).array());
-            requests.write(RespEncoder.request(List.of(ascii("ECHO"))).array());
-            requests.write(RespEncoder.request(List.of(ascii("GET"), ascii("key"))).array());
-            requests.write(RespEncoder.request(List.of(new byte[]{0, 13, 10, (byte) 255})).array());
+            requests.write(RespRequests.request(List.of(ascii("pInG"))).array());
+            requests.write(RespRequests.request(List.of(ascii("PING"), new byte[0])).array());
+            requests.write(RespRequests.request(List.of(ascii("PING"), ascii("a"), ascii("b"))).array());
+            requests.write(RespRequests.request(List.of(ascii("ECHO"))).array());
+            requests.write(RespRequests.request(List.of(ascii("UNKNOWN"), ascii("key"))).array());
+            requests.write(RespRequests.request(List.of(new byte[]{0, 13, 10, (byte) 255})).array());
             String expected = "+PONG\r\n$0\r\n\r\n"
                     + "-ERR wrong number of arguments for 'ping' command\r\n"
                     + "-ERR wrong number of arguments for 'echo' command\r\n"
@@ -317,6 +318,52 @@ class ServerTest {
         try (RunningServer idle = new RunningServer()) {
             idle.server.stop();
             idle.task.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void sharesStoredBinaryDataBetweenClientsAndSurvivesDisconnect() throws Exception {
+        try (RunningServer running = new RunningServer();
+             Socket reader = connect(running.server)) {
+            byte[] key = {0, 13, 10, (byte) 255};
+            byte[] value = payload(32 * 1024);
+            try (Socket writer = connect(running.server)) {
+                byte[] request = RespRequests.request(List.of(ascii("SET"), key, value)).array();
+                writer.setTcpNoDelay(true);
+                for (int i = 0; i < request.length; i += 37) {
+                    writer.getOutputStream().write(request, i, Math.min(37, request.length - i));
+                }
+                assertArrayEquals(ascii("+OK\r\n"), writer.getInputStream().readNBytes(5));
+            }
+            reader.getOutputStream().write(RespRequests.request(List.of(ascii("GET"), key)).array());
+            byte[] expected = bulk(value);
+            assertArrayEquals(expected, reader.getInputStream().readNBytes(expected.length));
+        }
+    }
+
+    @Test
+    void runsStoragePipelineInOrderAndKeepsConnectionAfterArityError() throws Exception {
+        try (RunningServer running = new RunningServer();
+             Socket client = connect(running.server)) {
+            String[][] commands = {
+                    {"SET", "a", "An"}, {"GET", "a"},
+                    {"EXISTS", "a", "a", "missing"}, {"SET", "a", "wrong", "NX"},
+                    {"GET", "a"}, {"DEL", "a", "a", "missing"}, {"GET", "a"}
+            };
+            ByteArrayOutputStream requests = new ByteArrayOutputStream();
+            for (String[] command : commands) {
+                List<byte[]> arguments = new ArrayList<>();
+                for (String argument : command) {
+                    arguments.add(ascii(argument));
+                }
+                requests.write(RespRequests.request(arguments).array());
+            }
+            client.getOutputStream().write(requests.toByteArray());
+            byte[] expected = ascii("+OK\r\n$2\r\nAn\r\n:2\r\n"
+                    + "-ERR wrong number of arguments for 'set' command\r\n"
+                    + "$2\r\nAn\r\n:1\r\n$-1\r\n");
+            assertArrayEquals(expected, client.getInputStream().readNBytes(expected.length));
+            echo(client, ascii("still connected"));
         }
     }
 

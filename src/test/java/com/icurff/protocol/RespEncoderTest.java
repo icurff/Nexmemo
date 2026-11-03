@@ -1,5 +1,6 @@
 package com.icurff.protocol;
 
+import com.icurff.testutil.RespRequests;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -31,7 +32,7 @@ class RespEncoderTest {
 
     @Test
     void encodesCommandArrayUsingByteLengths() {
-        encoded("*2\r\n$4\r\nECHO\r\n$3\r\nà\n\r\n", RespEncoder.request(List.of(
+        encoded("*2\r\n$4\r\nECHO\r\n$3\r\nà\n\r\n", RespRequests.request(List.of(
                 "ECHO".getBytes(StandardCharsets.US_ASCII), "à\n".getBytes(StandardCharsets.UTF_8))));
     }
 
@@ -39,7 +40,7 @@ class RespEncoderTest {
     void preventsLineInjectionAndDoesNotShareBuffers() {
         assertThrows(IllegalArgumentException.class, () -> RespEncoder.error("ERR\r\n+OK"));
         assertThrows(IllegalArgumentException.class, () -> RespEncoder.simpleString("hello\nworld"));
-        assertThrows(IllegalArgumentException.class, () -> RespEncoder.request(List.of()));
+        assertThrows(IllegalArgumentException.class, () -> RespRequests.request(List.of()));
         byte[] payload = {1, 2};
         ByteBuffer first = RespEncoder.bulkString(payload);
         payload[0] = 9;

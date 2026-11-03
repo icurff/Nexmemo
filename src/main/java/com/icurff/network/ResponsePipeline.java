@@ -6,24 +6,24 @@ import java.util.Queue;
 
 /** Request-order slots, owned and completed by the connection's event loop. */
 final class ResponsePipeline {
-    private final Queue<Slot> slots = new ArrayDeque<>(128);
+    private final Queue<ResponseSlot> slots = new ArrayDeque<>(128);
 
-    Slot reserve() {
-        Slot slot = new Slot();
-        slots.add(slot);
-        return slot;
+    ResponseSlot reserve() {
+        ResponseSlot responseSlot = new ResponseSlot();
+        slots.add(responseSlot);
+        return responseSlot;
     }
 
     /** Move only the completed prefix into the ordered socket-write queue. */
     void flushTo(Queue<ByteBuffer> output) {
         while (!slots.isEmpty()) {
-            Slot slot = slots.peek();
-            if (!slot.completed) {
+            ResponseSlot responseSlot = slots.peek();
+            if (!responseSlot.completed) {
                 break;
             }
-            output.add(slot.response);
+            output.add(responseSlot.response);
             slots.poll();
-            slot.response = null;
+            responseSlot.response = null;
         }
     }
 
@@ -31,7 +31,7 @@ final class ResponsePipeline {
         return slots.isEmpty();
     }
 
-    static final class Slot {
+    static final class ResponseSlot {
         private ByteBuffer response;
         private boolean completed;
 

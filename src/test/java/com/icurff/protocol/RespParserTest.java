@@ -1,12 +1,12 @@
 package com.icurff.protocol;
 
+import com.icurff.testutil.RespRequests;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 
@@ -18,14 +18,35 @@ class RespParserTest {
     }
 
     @Test
+    void retainsPartialHeaderAndPayloadInInput() throws Exception {
+        RespParser parser = new RespParser();
+        ByteBuffer input = ByteBuffer.allocate(32);
+        input.put(ascii("*")).flip();
+        assertNull(parser.parse(input));
+        assertTrue(parser.hasPartialRequest());
+        assertEquals("*", StandardCharsets.US_ASCII.decode(input.duplicate()).toString());
+
+        input.compact().put(ascii("1\r\n$4\r\nPI")).flip();
+        assertNull(parser.parse(input));
+        assertEquals("PI", StandardCharsets.US_ASCII.decode(input.duplicate()).toString());
+
+        input.compact().put(ascii("NG\r\n")).flip();
+        assertArrayEquals(ascii("PING"), parser.parse(input).getFirst());
+        assertFalse(parser.hasPartialRequest());
+    }
+
+    @Test
     void parsesEveryPossibleSplitIncludingCrLfAndBinaryPayload() throws Exception {
         byte[] frame = ascii("*3\r\n$4\r\nECHO\r\n$0\r\n\r\n$5\r\n\0\r\nXY\r\n");
         frame[frame.length - 3] = (byte) 255;
         for (int split = 1; split < frame.length; split++) {
             RespParser parser = new RespParser();
-            assertNull(parser.parse(ByteBuffer.wrap(Arrays.copyOfRange(frame, 0, split))));
+            ByteBuffer input = ByteBuffer.allocate(frame.length);
+            input.put(frame, 0, split).flip();
+            assertNull(parser.parse(input));
             assertTrue(parser.hasPartialRequest());
-            List<byte[]> request = parser.parse(ByteBuffer.wrap(Arrays.copyOfRange(frame, split, frame.length)));
+            input.compact().put(frame, split, frame.length - split).flip();
+            List<byte[]> request = parser.parse(input);
             assertNotNull(request, "split=" + split);
             assertEquals(3, request.size());
             assertArrayEquals(ascii("ECHO"), request.getFirst());
@@ -36,15 +57,14 @@ class RespParserTest {
     }
 
     @Test
-    void consumesOneByteAtATimeWithoutRetainingInputBuffer() throws Exception {
+    void retainsIncompleteInputWhenReceivingOneByteAtATime() throws Exception {
         byte[] frame = ascii("*1\r\n$4\r\nPING\r\n");
         RespParser parser = new RespParser();
-        ByteBuffer scratch = ByteBuffer.allocate(1);
+        ByteBuffer scratch = ByteBuffer.allocate(frame.length).flip();
         List<byte[]> request = null;
         for (int i = 0; i < frame.length; i++) {
-            scratch.clear().put(frame[i]).flip();
+            scratch.compact().put(frame[i]).flip();
             request = parser.parse(scratch);
-            assertFalse(scratch.hasRemaining());
             if (i < frame.length - 1) {
                 assertNull(request);
             }
@@ -80,11 +100,13 @@ class RespParserTest {
         frame.put(ascii("*1\r\n$" + payload.length + "\r\n")).put(payload).put(ascii("\r\n")).flip();
         RespParser parser = new RespParser();
         List<byte[]> request = null;
+        ByteBuffer input = ByteBuffer.allocate(frame.remaining()).flip();
         while (frame.hasRemaining()) {
             int count = Math.min(frame.remaining(), 1 + random.nextInt(8192));
             ByteBuffer chunk = frame.slice();
             chunk.limit(count);
-            request = parser.parse(chunk);
+            input.compact().put(chunk).flip();
+            request = parser.parse(input);
             frame.position(frame.position() + count);
             if (frame.hasRemaining()) {
                 assertNull(request);
@@ -117,7 +139,7 @@ class RespParserTest {
             arguments.add(new byte[0]);
         }
         RespParser parser = new RespParser();
-        List<byte[]> request = parser.parse(RespEncoder.request(arguments));
+        List<byte[]> request = parser.parse(RespRequests.request(arguments));
         assertEquals(arguments.size(), request.size());
         assertArrayEquals(large, request.get(1));
         assertArrayEquals(new byte[0], request.getLast());

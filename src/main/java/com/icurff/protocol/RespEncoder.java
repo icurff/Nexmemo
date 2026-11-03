@@ -2,7 +2,6 @@ package com.icurff.protocol;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.List;
 
 /** Encoded buffers are in read mode and owned by the caller. */
 public final class RespEncoder {
@@ -28,27 +27,6 @@ public final class RespEncoder {
         int totalSize = header.length + value.length + 2;
         ByteBuffer output = ByteBuffer.allocate(totalSize);
         output.put(header).put(value).put((byte) '\r').put((byte) '\n');
-        return output.flip();
-    }
-
-    /** Encode the array of bulk strings used by command clients. */
-    public static ByteBuffer request(List<byte[]> arguments) {
-        if (arguments.isEmpty()) {
-            throw new IllegalArgumentException("A request needs a command");
-        }
-        byte[] header = ("*" + arguments.size() + "\r\n").getBytes(StandardCharsets.US_ASCII);
-        int size = header.length;
-        for (byte[] argument : arguments) {
-            int lengthDigits = Integer.toString(argument.length).length();
-            int argumentSize = argument.length + lengthDigits + 5;
-            size = size + argumentSize;
-        }
-        ByteBuffer output = ByteBuffer.allocate(size);
-        output.put(header);
-        for (byte[] argument : arguments) {
-            output.put(("$" + argument.length + "\r\n").getBytes(StandardCharsets.US_ASCII));
-            output.put(argument).put((byte) '\r').put((byte) '\n');
-        }
         return output.flip();
     }
 
