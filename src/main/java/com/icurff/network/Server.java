@@ -17,10 +17,17 @@ import com.icurff.storage.KvStore;
 public final class Server {
     private final Selector selector;
     private final ServerSocketChannel listener;
-    private final CommandHandler handler = new CommandHandler(new KvStore());
+    private final KvStore store;
+    private final CommandHandler handler;
     private volatile boolean running = true;
 
     public Server(InetSocketAddress address) throws IOException {
+        this(address, new KvStore());
+    }
+
+    Server(InetSocketAddress address, KvStore store) throws IOException {
+        this.store = store;
+        handler = new CommandHandler(store);
         selector = Selector.open();
         ServerSocketChannel channel = null;
         try {
@@ -43,7 +50,8 @@ public final class Server {
     public void run() throws IOException {
         try {
             while (running) {
-                selector.select();
+                selector.select(100);
+                store.purgeExpired(100);
                 var keys = selector.selectedKeys().iterator();
                 while (running && keys.hasNext()) {
                     SelectionKey key = keys.next();

@@ -45,7 +45,7 @@ class CommandHandlerTest {
     void rejectsWrongArityWithoutChangingStorage() {
         execute("SET", "a", "original");
         String[][] invalid = {
-                {"SET"}, {"SET", "a"}, {"SET", "a", "changed", "NX"},
+                {"SET"}, {"SET", "a"},
                 {"GET"}, {"GET", "a", "b"}, {"DEL"}, {"EXISTS"}
         };
         for (String[] command : invalid) {
@@ -54,6 +54,8 @@ class CommandHandlerTest {
                     execute(command));
             assertEquals("$8\r\noriginal\r\n", execute("GET", "a"));
         }
+        assertEquals("-ERR syntax error\r\n", execute("SET", "a", "changed", "NX"));
+        assertEquals("$8\r\noriginal\r\n", execute("GET", "a"));
     }
 
     @Test

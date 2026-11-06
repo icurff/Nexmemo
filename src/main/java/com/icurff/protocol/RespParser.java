@@ -75,7 +75,7 @@ public final class RespParser {
         return state != State.ARRAY_LENGTH || partialHeader;
     }
 
-    /** Returns -1 without consuming input when the header is incomplete. */
+    /** Returns -1 when the header is incomplete. */
     private int parseLength(ByteBuffer input) throws ProtocolException {
         int start = input.position();
         char prefix = state == State.ARRAY_LENGTH ? '*' : '$';

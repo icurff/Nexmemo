@@ -360,7 +360,7 @@ class ServerTest {
             }
             client.getOutputStream().write(requests.toByteArray());
             byte[] expected = ascii("+OK\r\n$2\r\nAn\r\n:2\r\n"
-                    + "-ERR wrong number of arguments for 'set' command\r\n"
+                    + "-ERR syntax error\r\n"
                     + "$2\r\nAn\r\n:1\r\n$-1\r\n");
             assertArrayEquals(expected, client.getInputStream().readNBytes(expected.length));
             echo(client, ascii("still connected"));
